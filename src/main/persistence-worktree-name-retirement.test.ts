@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { getDefaultPersistedState } from '../shared/constants'
 import { MARINE_CREATURES } from '../shared/marine-creatures'
 import { createRetiredNameLookup } from '../shared/worktree/retired-name-registry'
+import type { SshTarget } from '../shared/ssh-types'
 
 const testState = { dir: '' }
 
@@ -18,6 +19,26 @@ vi.mock('./telemetry/cohort-classifier', () => ({ getCohortAtEmit: vi.fn() }))
 const REPO = 'repo-1'
 const OTHER_REPO = 'repo-2'
 const POOL = MARINE_CREATURES.map((name) => name.toLowerCase())
+
+const REMOTE_REPO = {
+  id: REPO,
+  path: '/remote/repos/a',
+  displayName: 'a',
+  badgeColor: '',
+  addedAt: 0
+}
+
+function sshTarget(id: string, overrides: Partial<SshTarget> = {}): SshTarget {
+  return {
+    id,
+    label: 'builder',
+    host: 'builder.example.com',
+    port: 22,
+    username: 'dev',
+    source: 'manual',
+    ...overrides
+  }
+}
 
 async function reloadStore() {
   vi.resetModules()
@@ -159,6 +180,147 @@ describe('worktree name retirement registry', () => {
 
     store = await reloadStore()
     const newRepo = { ...oldRepo, id: OTHER_REPO }
+    store.addRepo(newRepo)
+
+    await expect(
+      getRetiredNameRegistryForRepo(store, newRepo, [newRepo], store.getSettings())
+    ).resolves.toEqual({ exhaustedTiers: 0, names: ['nautilus'] })
+  })
+
+  it('preserves a Codex-only local retirement across remove and re-add', async () => {
+    const workspaceDir = join(testState.dir, 'workspaces')
+    const oldRepo = {
+      id: REPO,
+      path: join(testState.dir, 'repos', 'a'),
+      displayName: 'a',
+      badgeColor: '',
+      addedAt: 0
+    }
+    const store = await createStore()
+    store.updateSettings({ workspaceDir, nestWorkspaces: false })
+    store.addRepo(oldRepo)
+    const { getRetiredNameRegistryForRepo, retireGeneratedWorktreeName } =
+      await import('./worktree-name-retirement')
+    await retireGeneratedWorktreeName(store, oldRepo, store.getSettings(), 'nautilus')
+
+    // The deleted workspace has no Claude bucket; Codex rollout files are not backfilled.
+    store.removeProject(REPO)
+    const newRepo = { ...oldRepo, id: OTHER_REPO }
+    store.addRepo(newRepo)
+
+    await expect(
+      getRetiredNameRegistryForRepo(store, newRepo, [newRepo], store.getSettings())
+    ).resolves.toEqual({ exhaustedTiers: 0, names: ['nautilus'] })
+  })
+
+  it('preserves a remote retirement when an SSH target id rotates before re-add', async () => {
+    const store = await createStore()
+    store.addSshTarget(sshTarget('ssh-old'))
+    const oldRepo = { ...REMOTE_REPO, connectionId: 'ssh-old' }
+    store.addRepo(oldRepo)
+    const { getRetiredNameRegistryForRepo, retireGeneratedWorktreeName } =
+      await import('./worktree-name-retirement')
+    await retireGeneratedWorktreeName(store, oldRepo, store.getSettings(), 'nautilus')
+
+    // Removing and re-adding the host mints a fresh row id for the same machine and account.
+    store.removeProject(REPO)
+    store.removeSshTarget('ssh-old')
+    store.addSshTarget(sshTarget('ssh-new'))
+    const newRepo = { ...oldRepo, id: OTHER_REPO, connectionId: 'ssh-new' }
+    store.addRepo(newRepo)
+
+    await expect(
+      getRetiredNameRegistryForRepo(store, newRepo, [newRepo], store.getSettings())
+    ).resolves.toEqual({ exhaustedTiers: 0, names: ['nautilus'] })
+  })
+
+  it('does not leak a remote retirement to an SSH target on a different endpoint', async () => {
+    const store = await createStore()
+    store.addSshTarget(sshTarget('ssh-old'))
+    store.addSshTarget(sshTarget('ssh-other', { host: 'other.example.com' }))
+    const oldRepo = { ...REMOTE_REPO, connectionId: 'ssh-old' }
+    store.addRepo(oldRepo)
+    const { getRetiredNameRegistryForRepo, retireGeneratedWorktreeName } =
+      await import('./worktree-name-retirement')
+    await retireGeneratedWorktreeName(store, oldRepo, store.getSettings(), 'nautilus')
+
+    store.removeProject(REPO)
+    const otherRepo = { ...oldRepo, id: OTHER_REPO, connectionId: 'ssh-other' }
+    store.addRepo(otherRepo)
+
+    // A different machine has its own filesystem, so the spent name is free there.
+    await expect(
+      getRetiredNameRegistryForRepo(store, otherRepo, [otherRepo], store.getSettings())
+    ).resolves.toEqual({ exhaustedTiers: 0, names: [] })
+  })
+
+  it('reassigning a target id carries retirements written before endpoint identity', async () => {
+    // What the shipped code wrote: a namespace whose host half is the target row id.
+    const store = await createStore({
+      retiredWorktreeNamesByNamespace: {
+        'ssh:ssh-old:posix:/remote/repos/a-orca-retirement-probe': {
+          exhaustedTiers: 0,
+          names: ['nautilus']
+        }
+      }
+    })
+    store.addSshTarget(sshTarget('ssh-new'))
+    const repo = { ...REMOTE_REPO, connectionId: 'ssh-old' }
+    store.addRepo(repo)
+    store.reassignSshTargetId('ssh-old', 'ssh-new')
+
+    const { getRetiredNameRegistryForRepo } = await import('./worktree-name-retirement')
+    const readopted = store.getRepos().find((entry) => entry.id === REPO)!
+    expect(readopted.connectionId).toBe('ssh-new')
+    await expect(
+      getRetiredNameRegistryForRepo(store, readopted, [readopted], store.getSettings())
+    ).resolves.toEqual({ exhaustedTiers: 0, names: ['nautilus'] })
+  })
+
+  it('reassigning a target id carries retirements when the endpoint itself moved', async () => {
+    const store = await createStore()
+    store.addSshTarget(sshTarget('ssh-old', { configHost: 'builder', host: 'old.example.com' }))
+    const repo = { ...REMOTE_REPO, connectionId: 'ssh-old' }
+    store.addRepo(repo)
+    const { getRetiredNameRegistryForRepo, retireGeneratedWorktreeName } =
+      await import('./worktree-name-retirement')
+    await retireGeneratedWorktreeName(store, repo, store.getSettings(), 'nautilus')
+
+    // Drop the repo row, so the namespace copy is the only thing left holding the tombstone.
+    store.removeProject(REPO)
+    // The ssh-config alias is unchanged, so re-adoption matches even though the host moved.
+    store.removeSshTarget('ssh-old')
+    store.addRemovedSshTargetTombstone({
+      oldTargetId: 'ssh-old',
+      configHost: 'builder',
+      host: 'old.example.com',
+      port: 22,
+      username: 'dev',
+      label: 'builder',
+      removedAt: 0
+    })
+    store.addSshTarget(sshTarget('ssh-new', { configHost: 'builder', host: 'new.example.com' }))
+    store.reassignSshTargetId('ssh-old', 'ssh-new')
+
+    const newRepo = { ...repo, id: OTHER_REPO, connectionId: 'ssh-new' }
+    store.addRepo(newRepo)
+    await expect(
+      getRetiredNameRegistryForRepo(store, newRepo, [newRepo], store.getSettings())
+    ).resolves.toEqual({ exhaustedTiers: 0, names: ['nautilus'] })
+  })
+
+  it('shares one retirement bucket across SSH repos whose target row is gone', async () => {
+    // No target row means no endpoint to compare. Retirement prefers spending one name out of the
+    // pool over reissuing a cwd whose agent history is still on disk, so these share a bucket.
+    const store = await createStore()
+    const oldRepo = { ...REMOTE_REPO, connectionId: 'ssh-old' }
+    store.addRepo(oldRepo)
+    const { getRetiredNameRegistryForRepo, retireGeneratedWorktreeName } =
+      await import('./worktree-name-retirement')
+    await retireGeneratedWorktreeName(store, oldRepo, store.getSettings(), 'nautilus')
+
+    store.removeProject(REPO)
+    const newRepo = { ...oldRepo, id: OTHER_REPO, connectionId: 'ssh-new' }
     store.addRepo(newRepo)
 
     await expect(

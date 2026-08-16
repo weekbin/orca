@@ -176,6 +176,11 @@ import {
 import { pruneWorkspaceSessionBrowserHistory } from '../shared/workspace-session-browser-history'
 import { normalizeRetirableGeneratedName } from './worktree-name-retirement'
 import {
+  migrateRetirementNamespaceHostIdentity,
+  recordRetirementNamespaceRegistry,
+  sshHostIdentity
+} from './worktree-retirement-namespace'
+import {
   addRetiredNames,
   clampExhaustedTiers,
   compactRetiredNames,
@@ -7320,7 +7325,11 @@ export class Store {
       return false
     }
     this.state.retiredWorktreeNamesByNamespace ??= {}
-    this.state.retiredWorktreeNamesByNamespace[namespaceKey] = next
+    recordRetirementNamespaceRegistry(
+      this.state.retiredWorktreeNamesByNamespace,
+      namespaceKey,
+      next
+    )
     this.scheduleSave()
     return true
   }
@@ -7444,6 +7453,9 @@ export class Store {
     if (migrateUiHostScopeSshTargetId(this.state.ui, oldTargetId, newTargetId)) {
       carrierChanged = true
     }
+    if (this.migrateRetirementNamespacesForSshTarget(oldTargetId, newTargetId)) {
+      carrierChanged = true
+    }
     for (const lease of this.state.sshRemotePtyLeases ?? []) {
       if (lease.targetId === oldTargetId) {
         lease.targetId = newTargetId
@@ -7489,6 +7501,27 @@ export class Store {
       this.scheduleSave()
     }
     return [...repoIds]
+  }
+
+  /** Retirement namespaces key on the endpoint a target reaches, so a rotation moves them only
+   *  when the endpoint itself changed — plus any pre-identity key that embedded the row id. */
+  private migrateRetirementNamespacesForSshTarget(
+    oldTargetId: string,
+    newTargetId: string
+  ): boolean {
+    const newTarget = this.getSshTarget(newTargetId)
+    if (!newTarget) {
+      return false
+    }
+    // The removal tombstone is the only record of what endpoint the old id reached.
+    const tombstone = this.state.removedSshTargetTombstones?.find(
+      (entry) => entry.oldTargetId === oldTargetId
+    )
+    return migrateRetirementNamespaceHostIdentity(
+      this.state.retiredWorktreeNamesByNamespace,
+      [toSshExecutionHostId(oldTargetId), ...(tombstone ? [sshHostIdentity(tombstone)] : [])],
+      sshHostIdentity(newTarget)
+    )
   }
 
   // ── SSH PTY Consumer Recovery ──────────────────────────────────────
