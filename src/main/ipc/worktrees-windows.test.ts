@@ -352,17 +352,17 @@ describe('registerWorktreeHandlers – Windows path handling', () => {
     expect(store.addRetiredWorktreeName).toHaveBeenCalledWith('repo-1', 'nautilus-2')
   })
 
-  it('leaves a user-typed name reusable even when the same name is retired', async () => {
-    // Why: the creature pool contains ordinary words ("orca", "runner", "molly"). Silently
-    // renaming a deliberate `nautilus` to `nautilus-2` — and burning it — is the wrong trade.
+  it('skips a retired cwd on the local create path when the client omits provenance', async () => {
+    // Why: an older paired client sends no `nameWasGenerated`, and the retired set holds only cwds
+    // this host already spent — reusing one hands over the previous workspace's agent history.
     store.getRetiredWorktreeNameRegistry.mockReturnValue({ exhaustedTiers: 0, names: ['nautilus'] })
-    computeWorktreePathMock.mockReturnValue('C:\\workspaces\\nautilus')
-    ensurePathWithinWorkspaceMock.mockReturnValue('C:\\workspaces\\nautilus')
+    computeWorktreePathMock.mockReturnValue('C:\\workspaces\\nautilus-2')
+    ensurePathWithinWorkspaceMock.mockReturnValue('C:\\workspaces\\nautilus-2')
     listWorktreesMock.mockResolvedValue([
       {
-        path: 'C:/workspaces/nautilus',
+        path: 'C:/workspaces/nautilus-2',
         head: 'abc123',
-        branch: 'refs/heads/nautilus',
+        branch: 'refs/heads/nautilus-2',
         isBare: false,
         isMainWorktree: false
       }
@@ -372,11 +372,32 @@ describe('registerWorktreeHandlers – Windows path handling', () => {
 
     expect(addWorktreeMock).toHaveBeenCalledWith(
       'C:\\repo',
-      'C:\\workspaces\\nautilus',
-      'nautilus',
+      'C:\\workspaces\\nautilus-2',
+      'nautilus-2',
       'origin/main',
       false
     )
+    expect(store.addRetiredWorktreeName).toHaveBeenCalledWith('repo-1', 'nautilus-2')
+  })
+
+  it('never consults the retirement registry for a name outside the creature pool', async () => {
+    // Why: the pool holds ordinary words, so only pool-shaped names may be redirected. Everything
+    // else must skip the registry entirely — including its backfill scan.
+    computeWorktreePathMock.mockReturnValue('C:\\workspaces\\fix-login')
+    ensurePathWithinWorkspaceMock.mockReturnValue('C:\\workspaces\\fix-login')
+    listWorktreesMock.mockResolvedValue([
+      {
+        path: 'C:/workspaces/fix-login',
+        head: 'abc123',
+        branch: 'refs/heads/fix-login',
+        isBare: false,
+        isMainWorktree: false
+      }
+    ])
+
+    await handlers['worktrees:create'](null, { repoId: 'repo-1', name: 'fix-login' })
+
+    expect(store.getRetiredWorktreeNameRegistry).not.toHaveBeenCalled()
     expect(store.addRetiredWorktreeName).not.toHaveBeenCalled()
   })
 

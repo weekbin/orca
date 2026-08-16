@@ -136,17 +136,14 @@ import {
 } from '../project-runtime-git-options'
 import {
   getBranchNameOverrideCandidate,
-  getGeneratedWorktreeCreateCandidate,
-  getWorktreeCreateCandidate,
-  isGeneratedWorktreeCreateName,
   WORKTREE_CREATE_MAX_SUFFIX_ATTEMPTS
 } from '../worktree-create-candidates'
+import { planWorktreeCreateNames } from '../worktree-create-name-plan'
 import {
   failedWorktreeCreationNeedsRetirement,
   getRetiredNameRegistryForRepo,
   retireGeneratedWorktreeName
 } from '../worktree-name-retirement'
-import { createRetiredNameLookup } from '../../shared/worktree/retired-name-registry'
 
 const SSH_WORKTREE_CREATE_FETCH_FRESHNESS_MS = 30_000
 const SSH_WORKTREE_CREATE_FETCH_CACHE_MAX = 512
@@ -1562,29 +1559,20 @@ export async function createRemoteWorktree(
   let selectedExistingLocalBranchName: string | null = null
   let lastBranchConflictKind: 'local' | 'remote' | null = null
   let remotePathResolved = false
-  const shouldRetireGeneratedName =
-    args.nameWasGenerated === true && isGeneratedWorktreeCreateName(sanitizedName)
-  const retiredNameRegistry = shouldRetireGeneratedName
-    ? await getRetiredNameRegistryForRepo(store, repo, store.getRepos(), settings)
-    : null
-  const isRetiredName = retiredNameRegistry ? createRetiredNameLookup(retiredNameRegistry) : null
+  const namePlan = await planWorktreeCreateNames({
+    sanitizedName,
+    requestedName: args.name,
+    nameWasGenerated: args.nameWasGenerated,
+    loadRetiredNames: () => getRetiredNameRegistryForRepo(store, repo, store.getRepos(), settings)
+  })
   // Why: duplicate PR/MR checkouts still need a workspace; suffix branch/path while preserving review metadata and push target.
   for (let suffix = 1, attempts = 0; attempts < WORKTREE_CREATE_MAX_SUFFIX_ATTEMPTS; suffix += 1) {
-    effectiveSanitizedName = shouldRetireGeneratedName
-      ? getGeneratedWorktreeCreateCandidate(
-          sanitizedName,
-          suffix,
-          retiredNameRegistry?.exhaustedTiers
-        )
-      : getWorktreeCreateCandidate(sanitizedName, suffix)
-    effectiveRequestedName = shouldRetireGeneratedName
-      ? effectiveSanitizedName
-      : args.name.trim()
-        ? getWorktreeCreateCandidate(args.name, suffix)
-        : effectiveSanitizedName
-    if (isRetiredName?.(effectiveSanitizedName)) {
+    const nameCandidate = namePlan.candidateAt(suffix)
+    if (!nameCandidate) {
       continue
     }
+    effectiveSanitizedName = nameCandidate.sanitizedName
+    effectiveRequestedName = nameCandidate.requestedName
     attempts += 1
     branchName = await resolveCreateBranchNameSsh(
       provider,
@@ -1786,7 +1774,7 @@ export async function createRemoteWorktree(
       } catch (rollbackError) {
         console.warn('[worktree-create] Failed to roll back remote sparse worktree:', rollbackError)
       }
-      if (!rollbackSucceeded && shouldRetireGeneratedName) {
+      if (!rollbackSucceeded && namePlan.retiresCreatedName) {
         await retireGeneratedWorktreeName(store, repo, settings, effectiveSanitizedName)
       }
       throw err
@@ -1794,7 +1782,7 @@ export async function createRemoteWorktree(
   }
 
   // Why: fallible metadata work after creation must not leave a real workspace name reusable.
-  if (shouldRetireGeneratedName) {
+  if (namePlan.retiresCreatedName) {
     await retireGeneratedWorktreeName(store, repo, settings, effectiveSanitizedName)
   }
 
@@ -2138,29 +2126,20 @@ export async function createLocalWorktree(
   let lastBranchConflictKind: 'local' | 'remote' | null = null
   let lastExistingPR: Awaited<ReturnType<typeof getPRForBranch>> | null = null
   let lastExistingReviewNumber: number | null = null
-  const shouldRetireGeneratedName =
-    args.nameWasGenerated === true && isGeneratedWorktreeCreateName(sanitizedName)
-  const retiredNameRegistry = shouldRetireGeneratedName
-    ? await getRetiredNameRegistryForRepo(store, repo, store.getRepos(), settings)
-    : null
-  const isRetiredName = retiredNameRegistry ? createRetiredNameLookup(retiredNameRegistry) : null
+  const namePlan = await planWorktreeCreateNames({
+    sanitizedName,
+    requestedName,
+    nameWasGenerated: args.nameWasGenerated,
+    loadRetiredNames: () => getRetiredNameRegistryForRepo(store, repo, store.getRepos(), settings)
+  })
   // Why: a create-from-review branch override may already exist locally; suffix both branch and path instead of blocking the user.
   for (let suffix = 1, attempts = 0; attempts < WORKTREE_CREATE_MAX_SUFFIX_ATTEMPTS; suffix += 1) {
-    effectiveSanitizedName = shouldRetireGeneratedName
-      ? getGeneratedWorktreeCreateCandidate(
-          sanitizedName,
-          suffix,
-          retiredNameRegistry?.exhaustedTiers
-        )
-      : getWorktreeCreateCandidate(sanitizedName, suffix)
-    effectiveRequestedName = shouldRetireGeneratedName
-      ? effectiveSanitizedName
-      : requestedName.trim()
-        ? getWorktreeCreateCandidate(requestedName, suffix)
-        : effectiveSanitizedName
-    if (isRetiredName?.(effectiveSanitizedName)) {
+    const nameCandidate = namePlan.candidateAt(suffix)
+    if (!nameCandidate) {
       continue
     }
+    effectiveSanitizedName = nameCandidate.sanitizedName
+    effectiveRequestedName = nameCandidate.requestedName
     attempts += 1
     lastExistingReviewNumber = null
 
@@ -2423,14 +2402,14 @@ export async function createLocalWorktree(
             )
       })) ?? {}
   } catch (error) {
-    if (shouldRetireGeneratedName && failedWorktreeCreationNeedsRetirement(error)) {
+    if (namePlan.retiresCreatedName && failedWorktreeCreationNeedsRetirement(error)) {
       await retireGeneratedWorktreeName(store, repo, settings, effectiveSanitizedName)
     }
     throw error
   }
 
   // Why: fallible metadata work after creation must not leave a real workspace name reusable.
-  if (shouldRetireGeneratedName) {
+  if (namePlan.retiresCreatedName) {
     await retireGeneratedWorktreeName(store, repo, settings, effectiveSanitizedName)
   }
 
