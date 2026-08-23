@@ -16,8 +16,17 @@
 set -euo pipefail
 
 # Resolve repo root from this script's location so it works from any cwd.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+# Why: when invoked via a `git <alias>`, git exports GIT_DIR, which makes
+# `git -C <subdir> rev-parse --show-toplevel` return <subdir> instead of
+# walking up to the real toplevel. Walking up looking for a .git entry is
+# robust whether the script is called directly, from a git alias, or from
+# inside a worktree (where .git is a gitdir pointer file, not a directory).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+REPO_ROOT="$SCRIPT_DIR"
+while [[ ! -e "$REPO_ROOT/.git" && "$REPO_ROOT" != "/" ]]; do
+  REPO_ROOT="$(dirname "$REPO_ROOT")"
+done
+[[ -n "$REPO_ROOT" && "$REPO_ROOT" != "/" ]] || die "Could not locate repo root from $SCRIPT_DIR"
 
 BRANCH="main-weekbin"
 UPSTREAM_REMOTE="origin"
