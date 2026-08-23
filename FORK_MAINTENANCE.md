@@ -76,22 +76,34 @@ git rebase --abort
 
 ### When upstream is far behind
 
-A first sync with hundreds of new upstream commits is the riskiest moment. To make it tractable, you can do incremental updates:
+A first sync with hundreds of new upstream commits is the riskiest moment. Hot files like `src/main/index.ts` may have hundreds of upstream changes since the last sync, so a single `git rebase origin/main` will almost certainly stop in the middle with conflicts. Two reasonable strategies:
+
+**Strategy 1: chunked rebase (recommended for the first sync)**
 
 ```bash
-# Find the most recent upstream commit main-weekbin already has:
-UPSTREAM_TIP=$(git rev-parse origin/main)
-# Pick a count of upstream commits to add (e.g. 50) and create a temp ref:
+# Create a temp ref pointing at a midpoint in upstream history:
 git fetch origin main
-git update-ref refs/heads/upstream-step refs/remotes/origin/main
-# Move the ref back 50 commits:
-git update-ref refs/heads/upstream-step $(git rev-list -n 1 HEAD~50 origin/main)
-# Rebase onto that intermediate point:
+git update-ref refs/heads/upstream-step origin/main
+# Walk it back N commits at a time:
+git update-ref refs/heads/upstream-step $(git rev-list -n 1 "~${N}" origin/main)
+# Rebase main-weekbin onto that midpoint:
 git rebase upstream-step
-# Repeat, or fast-forward upstream-step forward and rebase again.
+# Repeat with progressively larger N until you can rebase straight onto origin/main.
 ```
 
-In practice, just run `git sync-upstream` and let conflicts surface. Resolve them, run typecheck, push. The script keeps the untracked-file dance safe so you don't lose work.
+Once you are within ~20 commits of `origin/main`, plain `git sync-upstream` finishes in one pass.
+
+**Strategy 2: just run it and resolve as you go**
+
+```bash
+git sync-upstream
+# If it stops with conflicts, fix them, then:
+git add <resolved files>
+git rebase --continue
+git sync-upstream --push      # after the rebase finishes
+```
+
+`fork/sync-upstream.sh` keeps untracked files out of the way during the rebase and restores them after, so a half-finished rebase never silently loses work.
 
 ## Adding a new custom feature
 
